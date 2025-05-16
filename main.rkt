@@ -52,6 +52,8 @@
           compiled-identifier=?
           free-identifiers
           alpha-equivalent?
+          identifier=?
+          subst
           get-racket-referenced-identifiers))
 
 (require "private/syntax/interface.rkt"

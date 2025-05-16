@@ -226,6 +226,19 @@ Returns @racket[#t] if the two DSL expressions are alpha-equivalent, @racket[#f]
 
 Host expressions currently are not supported.
 
+@defproc[(subst [stx syntax?] [target syntax?] [replacement syntax?]) syntax?]
+
+Substitutes occurences of (expressions @racket[alpha-equivalent?] to) @racket[target] with @racket[replacement] in @racket[stx].
+
+All arguments must be the result of DSL expansion, not just plain racket expressions.
+
+In the case that @racket[target] is an identifier from a binding position, references will be replaced by @racket[replacement].
+
+Host expressions are left unchanged.
+
+NOTE: In order to avoid hygiene issues, it may be necessary to re-expand using @racket[nonterminal-expander] after substitution.
+@;TODO example where you need to re-expand
+
 @defform[(get-racket-referenced-identifiers [binding-class-id ...] expr)]
 
 Returns an immutable symbol set containing identifiers of the specified binding classes that were referenced in racket (host) expressions in @racket[expr].
