@@ -9,14 +9,14 @@
                      syntax/parse
                      syntax/transformer))
 
-(struct class-info [name->method-index method-table constructor])
-;; A ClassInfo is a (class-info (symbol -> natural) (any ... -> Object)) where
-;; name->method-index maps a method name to its vector index in the method-table
-;; method-table is a vector of methods
+(struct class-info [methods constructor])
+;; A ClassInfo is a (class-info (HashEq Symbol Method) (any ... -> Object)) where
+;; methods maps a method name to its implementation
+;; constructor creates an instance of the class
 ;; Represents a class itself
 
 (struct object [fields class])
-;; An Object is a (object (vector any) (vector Method) Class) where
+;; An Object is a (object (VectorOf any) (VectorOf Method) Class) where
 ;; fields is a vector of field-values
 ;; class is the class of which this object is an instance
 ;; Represents an object, which is an instance of a class
@@ -47,7 +47,7 @@
     (field name:field-var ...)
     #:binding [(export name) ...]
     ((~literal define-values) (m:method-var)
-      (lambda:lambda-id (arg:id ...) body:racket-expr ...))
+                              (lambda:lambda-id (arg:id ...) body:racket-expr ...))
     #:binding (export m)
 
     ((~literal define-syntaxes) (x:racket-macro ...) e:expr)
@@ -55,8 +55,8 @@
 
     ((~literal begin) e:class-form ...)
     #:binding [(re-export e) ...]
-
-    e:racket-expr)
+    e:racket-body
+    #:binding (re-export e))
 
   (host-interface/expression
     (class e:class-form ...)
@@ -109,12 +109,15 @@
        (for ([field-name (attribute field-name)]
              [field-index (in-naturals)])
          (symbol-table-set! field-index-table field-name field-index))
-       #'(letrec ([method-table
-                   (vector (lambda (this-arg method-arg ...)
+       #'(letrec ([methods
+                   (make-immutable-hash
+                    (list
+                     (cons 'method-name
+                           (lambda (this-arg method-arg ...)
                              (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
                                method-body
-                               ...))
-                           ...)]
+                               ...)))
+                     ...))]
                   [constructor
                    (lambda (field-name ...)
                      (let ([this-val (object (vector field-name ...) cls)])
@@ -124,10 +127,8 @@
                          expr
                          ...)
                        this-val))]
-                  [method-name->index
-                   (make-name->index (list 'method-name ...))]
                   [cls
-                   (class-info method-name->index method-table constructor)])
+                   (class-info methods constructor)])
            cls)]))
 
   (define method-reference-compiler
@@ -154,15 +155,6 @@
       (when duplicate
         (raise-syntax-error #f "a method with same name has already been defined" duplicate)))))
 
-#;((listof symbol?) -> (symbol? -> natural?))
-;; Create a function that maps method names to their method table indices
-(define (make-name->index names)
-  (let ([table (for/hasheq ([name names]
-                            [idx (in-naturals)])
-                 (values name idx))])
-    (lambda (name)
-      (hash-ref table name (lambda () (error 'send "no such method ~a" name))))))
-
 (define (new cls . fields)
   (apply (class-info-constructor cls) fields))
 
@@ -176,7 +168,5 @@
 #;(object? symbol? (listof any/c) -> any/c)
 (define (send-rt obj method-name args)
   (let* ([cls (object-class obj)]
-         [index ((class-info-name->method-index cls) method-name)]
-         [method-table (class-info-method-table cls)]
-         [method (vector-ref method-table index)])
+         [method (hash-ref (class-info-methods cls) method-name (lambda () (error 'send "unknown method ~a" method-name)))])
     (apply method obj args)))
