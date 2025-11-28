@@ -47,16 +47,15 @@
     (field name:field-var ...)
     #:binding [(export name) ...]
     ((~literal define-values) (m:method-var)
-                              (lambda:lambda-id (arg:id ...) body:racket-expr ...))
-    #:binding (export m)
+                              (lambda:lambda-id (arg:racket-var ...) body:racket-body ...))
+    #:binding [(export m) (scope (bind arg) ... (import body) ...)]
 
     ((~literal define-syntaxes) (x:racket-macro ...) e:expr)
     #:binding (export-syntaxes x ... e)
 
     ((~literal begin) e:class-form ...)
     #:binding [(re-export e) ...]
-    e:racket-body
-    #:binding (re-export e))
+    e:racket-expr)
 
   (host-interface/expression
     (class e:class-form ...)

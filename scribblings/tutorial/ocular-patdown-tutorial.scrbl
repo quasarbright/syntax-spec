@@ -126,9 +126,9 @@ Some patterns are equivalent to others. For example:
 (cons a (cons b (cons c _)))
 ]
 
-(We don't care about the possibility of there being more elements after @racket[c])
+For the purpose of this tutorial, we will only allow a single clause in @racket[update] and assume that the pattern is appropriate for the target. The real implementation supports multiple clauses and checks that patterns match, but this tutorial follows a simplified version of the DSL. Thus, we will use a wildcard pattern for the tail of the list, ignoring the possibility of there being more elements.
 
-We will use dsl macros for patterns like @racket[list] which can be expressed in terms of simpler ones.
+We will use DSL macros for patterns like @racket[list] which can be expressed in terms of simpler ones.
 
 There are also patterns that aren't equivalent to each other, but compile to very similar code. Consider these two examples:
 
@@ -189,20 +189,22 @@ Since a lot of the complexity is in the procedural implementation of lenses, the
 
 @racket[optic] and @racket[and] are so general, we actually don't need any other core forms! All other patterns we need can be expressed in terms of them.
 
-@racketgrammar[#:literals (optic and)
+@racketgrammar[#:literals (optic and2)
 pat
 id
 _
 (optic optic-expr pat)
-(and pat ...+)
+(and2 pat pat)
 ]
+
+(@racket[and] can be sugar on top of @racket[and2])
 
 There we have it. Now we have to implement it with @racket[syntax-spec].
 
 @racketblock[
 (require (for-syntax syntax/parse syntax/parse/class/struct-id))
 (syntax-spec
-  (binding-class optic-var #:reference-compiler optic-var-reference-compiler)
+  (binding-class optic-var)
   (extension-class pattern-macro
     #:binding-space pattern-update)
   (nonterminal/exporting pat
@@ -223,39 +225,43 @@ We define a binding class for pattern variables, an extension class for pattern 
 
 We use an exporting nonterminal because all pattern variables are in scope in the body, and we don't want to allow duplicates.
 
-We have a special rewrite rule for struct names since we can't use productions or dsl macros for all possible struct names. The pattern macro @racket[struct*] will expand to uses of @racket[and], @racket[optic], and @racket[struct-lens].
+We have a special rewrite rule for struct names since we can't use productions or DSL macros for all possible struct names. The pattern macro @racket[struct*] will expand to uses of @racket[and], @racket[optic], and @racket[struct-lens].
 
-Let's also implement some of our syntactic sugar:
+Now that we've defined our core grammar and extensibility, let's implement some of our syntactic sugar:
 
 @racketblock[
 (define-dsl-syntax cons pattern-macro
-  (syntax-rules ()
-     [(cons a d)
-      (and (optic car-lens a)
-           (optic cdr-lens d))]))
+  (syntax-parser
+    [(_ a d)
+     #'(and (optic car-lens a)
+            (optic cdr-lens d))]))
 
 (define-dsl-syntax list pattern-macro
-   (syntax-parser
-     [(list)
-      #'_]
-     [(list p (~datum ...))
-      #'(optic list-traversal p)]
-     [(list p0 p ...)
-      #'(cons p0 (list p ...))]))
+  (syntax-parser
+    [(_)
+     #'_]
+    [(_ p (~datum ...))
+     #'(optic list-traversal p)]
+    [(_ p0 p ...)
+     #'(cons p0 (list p ...))]))
 
 (define-dsl-syntax and pattern-macro
-  (syntax-rules ()
-    [(and)
-     _]
-    [(and p0 p ...)
-     (and2 p0 (and p ...))]))
+  (syntax-parser
+    [(_)
+     #'_]
+    [(_ p0 p ...)
+     #'(and2 p0 (and p ...))]))
 ]
+
+We are defining DSL macros that have the same name as built-in forms and procedures from Racket. However, since we're using binding spaces, we aren't actually shadowing these built-in names.
 
 Now that we have our core grammar, expander, and some convenient syntactic sugar, we're ready to implement the compiler.
 
 @section{The Compiler}
 
-The compiler has two main pieces: The pattern compiler and the body "compiler". The pattern compiler translates patterns into @racket[let] and optics, and the body "compiler" establishes the parameter and transforms variables usages. The body "compiler" isn't a compiler in the same sense as the pattern compiler since it's really just customizing the expansion of the body, which is a Racket expression.
+The compiler has two main pieces: The pattern compiler and the body "compiler". The pattern compiler translates patterns into @racket[let] and optics, and the body "compiler" establishes the parameter and transforms variable usages. The body "compiler" isn't a compiler in the same sense as the pattern compiler since it's really just customizing the expansion of the body, which is a Racket expression, or several Racket expressions. We want to support arbitrary Racket expressions to allow for maximum flexibility in the body.
+
+The clause body is an example of a multi-language boundary between our update language and Racket. The body is under a special context introduced by update, hence the need for the body compiler to establish that context.
 
 @subsection{The Pattern Compiler}
 
@@ -271,7 +277,7 @@ We've seen a few examples of pattern compilation. Here is a refresher:
   <body>)
 ]
 
-We're ignoring the parameter stuff for now.
+We're ignoring body compilation for now.
 
 But what happens when we have nested patterns?
 
@@ -325,7 +331,7 @@ Now let's actually implement this:
   (syntax-parser
     [(_ current-optic:id p body)
      (syntax-parse #'p
-       #:literal-sets (pattern-literals)
+       #:datum-literals (_ optic and2)
        [_ #'body]
        [var:id
         #'(let ([var current-optic])
@@ -338,7 +344,9 @@ Now let's actually implement this:
             (bind-optics current-optic p2 body))])]))
 ]
 
-Our compiler @racket[bind-optics] takes in the current optic variable name (like @racket[tmp] in our earlier example), the pattern to compile, and the body.
+Our compiler @racket[bind-optics] takes in the current optic variable name, the pattern to compile, and the body.
+
+@racket[current-optic] is like @racket[tmp] in our earlier example. It refers to an optic that focuses on the part of the structure that this pattern is matching on. As we compile nested patterns, we'll compose optics from sub-patterns with this current optic to drill down further.
 
 One important invariant is that all of the variables of @racket[p] will be bound in @racket[body].
 
@@ -403,11 +411,17 @@ Now that we establish the parameter, let's transform variable usages with a refe
           (current-update-target
            (lens-set x (current-update-target) val))
           (current-update-target))])))
+
+(syntax-spec
+  (binding-class optic-var #:reference-compiler optic-var-reference-compiler)
+  ...)
 ]
 
-Variable references turn into @racket[lens-get] and @racket[set!] turn into @racket[lens-set]. The result of @racket[set!] is the new value of the target. Again, the only mutation is of the parameter, the actual value of the target itself is not being mutated.
+We must also set the reference compiler in our binding class declaration.
 
-This is an interesting example of a reference compiler. The pattern compiler binds these variables to lenses without having to worry about any of this parameter stuff. The reference compiler then transforms usages of the pattern variable in terms of what it's bound to by the pattern compiler. Reference compilers like @racket[immutable-reference-compiler] simply restrict how DSL-bound variables can be used, but this reference compiler completely alters the behavior of DSL-bound variables.
+Variable references turn into @racket[lens-get] and @racket[set!] turn into @racket[lens-set]. The result of @racket[set!] is the new value of the target. This is unlike Racket's usual @racket[set!], which returns void. And again, the only mutation is of the parameter, the actual value of the target itself is not being mutated.
+
+This is an interesting example of a reference compiler. The pattern compiler binds pattern variables to optics without reference to the target value. The reference compiler then transforms uses of the pattern variable to apply the corresponding optic to the @racket[current-update-target]. Reference compilers like @racket[immutable-reference-compiler] simply restrict how DSL-bound variables can be used, but this reference compiler completely alters the behavior of DSL-bound variables.
 
 We can add even more custom variable behavior. For example, what if instead of getting the value that a pattern variable refers to, we want its optic directly? Somehow, we'd have to prevent the reference compiler from transforming the variable reference to a @racket[lens-get]. We can do this by adding another host interface:
 
@@ -445,7 +459,7 @@ To summarize some key points:
 @itemlist[
 @item{We created a @racket[syntax-spec] frontend around a procedural library for optics to make it more convenient to use.}
 @item{We used custom reference compilers to control the behavior of DSL-bound variables referenced in Racket expressions.}
-@item{We used a rewrite rule and dsl macros to use struct names as the head of a DSL form.}
+@item{We used a rewrite rule and DSL macros to use struct names as the head of a DSL form.}
 @item{We used a host interface to create a special case for the behavior of a DSL variable used in Racket expressions.}
 @item{We used parameters to manage runtime state.}
 @item{Our (recursive) pattern compiler has several invariants that inductively ensure its correctness.}

@@ -300,3 +300,13 @@
                                                         (my-fields x)))
                                         #:namespace ns))
                          2))
+(test-case "define in method"
+  (define v
+    (new
+     (class
+       (define (f)
+         (define x 2)
+         x))))
+  (check-equal?
+   (send v f)
+   2))
