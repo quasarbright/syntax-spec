@@ -202,7 +202,7 @@ _
 There we have it. Now we have to implement it with @racket[syntax-spec].
 
 @racketblock[
-(require (for-syntax syntax/parse syntax/parse/class/struct-id))
+(require syntax-spec-dev (for-syntax syntax/parse syntax/parse/class/struct-id))
 (syntax-spec
   (binding-class optic-var)
   (extension-class pattern-macro

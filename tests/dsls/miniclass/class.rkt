@@ -4,7 +4,6 @@
 
 (require "../../../main.rkt"
          racket/stxparam
-         syntax/transformer
          (for-syntax racket/list
                      syntax/parse
                      syntax/transformer))
@@ -47,7 +46,7 @@
     (field name:field-var ...)
     #:binding [(export name) ...]
     ((~literal define-values) (m:method-var)
-                              (lambda:lambda-id (arg:racket-var ...) body:racket-body ...))
+      (lambda:lambda-id (arg:racket-var ...) body:racket-body ...))
     #:binding [(export m) (scope (bind arg) ... (import body) ...)]
 
     ((~literal define-syntaxes) (x:racket-macro ...) e:expr)
@@ -55,7 +54,9 @@
 
     ((~literal begin) e:class-form ...)
     #:binding [(re-export e) ...]
-    e:racket-expr)
+
+    e:racket-body
+    #:binding (re-export e))
 
   (host-interface/expression
     (class e:class-form ...)
@@ -64,7 +65,7 @@
     (compile-class-body defns fields exprs)))
 
 (begin-for-syntax
-  (define-persistent-symbol-table field-index-table)
+  (define field-index-table (local-symbol-table))
 
   #;((listof syntax?) -> (listof syntax?))
   ;; splices begins (recursively), returns flattened list of exprs.
@@ -85,13 +86,13 @@
     (syntax-parse exprs
       #:literals (define-values define-syntaxes field)
       [((~alt (~and defn (define-values . _))
-              ;; ignore because they don't end up in the generated code
               (~and stx-defn (define-syntaxes . _))
-              (~and field-decl (field . _))
+              (field field-name ...)
               expr)
         ...)
+       ;; discard stx-defn because syntax definitions don't end up in the generated code
        (values (attribute defn)
-               (attribute field-decl)
+               #'(field-name ... ...)
                (attribute expr))]))
 
   #;((listof syntax?) (listof syntax?) (listof syntax?) -> syntax?)
@@ -101,8 +102,7 @@
     (syntax-parse (list defns fields exprs)
       #:literals (define-values field)
       [(((define-values (method-name:id) (_ (method-arg:id ...) method-body:expr ...)) ...)
-        ;; only 1 field definition allowed
-        ((~optional (field field-name:id ...) #:defaults ([(field-name 1) null])))
+        (field-name:id ...)
         (expr ...))
        (check-duplicate-method-names (attribute method-name))
        (for ([field-name (attribute field-name)]

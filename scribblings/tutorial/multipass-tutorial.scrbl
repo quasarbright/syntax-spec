@@ -186,7 +186,7 @@ Here is the syntax-spec of our language:
 
 @racketmod[
 racket
-(require syntax-spec (for-syntax syntax/parse racket/syntax racket/match racket/list))
+(require syntax-spec-dev (for-syntax syntax/parse racket/syntax racket/match racket/list))
 (syntax-spec
   (binding-class var
                  #:reference-compiler immutable-reference-compiler)

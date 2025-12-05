@@ -5,7 +5,8 @@
 (require drracket/check-syntax
          (for-syntax syntax/parse)
          rackunit
-         syntax/macro-testing)
+         syntax/macro-testing
+         racket/match)
 
 (begin-for-syntax (define v (box 0)))
 
@@ -310,3 +311,20 @@
   (check-equal?
    (send v f)
    2))
+(test-case "match-define"
+  (define v
+    (new
+     (class
+       (define/match (fact n)
+         [(0) 1]
+         [(n) (* n (fact (sub1 n)))]))))
+  (check-equal? (send v fact 4)
+                24))
+#;
+(test-case "non-method definition"
+  (define v
+    (new
+     (class
+      (define x 2)
+      (define (f) x))))
+  (check-equal? (send v f) 2))

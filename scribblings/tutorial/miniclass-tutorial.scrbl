@@ -1,8 +1,7 @@
 #lang scribble/manual
 
 @(require (for-label racket racket/block racket/class racket/match racket/list syntax/transformer syntax/parse "../../main.rkt")
-          scribble/example
-          racket/sandbox)
+          scribble/example)
 @(define eval (make-base-eval '(require racket racket/stxparam syntax/transformer (for-syntax racket syntax/transformer))))
 @(define-syntax-rule (repl body ...) (examples #:eval eval #:label #f body ...))
 @repl[
@@ -17,12 +16,13 @@ It is possible to create a DSL that re-interprets Racket forms like @racket[defi
 Here is an example of using the language we'll build:
 
 @repl[
-(define foo%
+(define posn%
   (class
-    (field x)
-    (define (add y) (+ x y))))
-(define foo (new foo% 1))
-(send foo add 2)
+    (field x y)
+    (define (scale k) (new posn% (* x k) (* y k)))
+    (define (displayln) `(posn ,x ,y))))
+(define p (new posn% 1 2))
+(send (send p scale 3) displayln)
 ]
 
 @section[#:tag "miniclass-expander"]{Expander}
@@ -31,9 +31,8 @@ Let's start by defining the grammar:
 
 @racketmod[
 racket
-(require syntax-spec
+(require syntax-spec-dev
          racket/stxparam
-         syntax/transformer
          (for-syntax racket/list
                      syntax/parse
                      syntax/transformer))
@@ -43,17 +42,17 @@ racket
     (pattern (~or (~literal lambda) (~literal #%plain-lambda)))))
 
 (syntax-spec
-  (binding-class method-var
+  (binding-class method-name
     #:reference-compiler method-reference-compiler)
-  (binding-class field-var
+  (binding-class field-name
     #:reference-compiler field-reference-compiler)
 
   (nonterminal/exporting class-form
     #:allow-extension racket-macro
-    (field name:field-var ...)
+    (field name:field-name ...)
     #:binding [(export name) ...]
-    ((~literal define-values) (m:method-var)
-                              (lambda:lambda-id (arg:racket-var ...) body:racket-body ...))
+    ((~literal define-values) (m:method-name)
+      (lambda:lambda-id (arg:racket-var ...) body:racket-body ...))
     #:binding [(export m) (scope (bind arg) ... (import body) ...)]
 
     ((~literal define-syntaxes) (x:racket-macro ...) e:expr)
@@ -65,13 +64,19 @@ racket
     e:racket-expr))
 ]
 
-We create separate binding classes for methods and fields because they will behave differently when used in the class body, hence the different reference compilers.
+We create separate binding classes for method and field names so that we can transform references to methods and fields differently when they appear in the class body.
+
+@margin-note{
+We could allow arbitrary Racket definitions in the class body using @racket[racket-body] instead of @racket[racket-expr]. However, this would require a more sophisticated compilation strategy to allow methods to close over these definitions.
+}
 
 The @racket[class-form] nonterminal is for forms that will appear in the class body. We support field declarations, method definitions, macro definitions, @racket[begin], and arbitrary Racket expressions. The Racket expressions will run once, in the constructor.
 
-If we wanted to allow arbitrary Racket definitions in the class body as well, we could use @racket[racket-body] instead of @racket[racket-expr] like we do in the body of a method. However, since we have a production for @racket[define-values], that production will commit any time it sees a form starting with @racket[define-values], so any definition will be treated like a method definition. Definitions of non-functions will error as bad syntax.
+@margin-note{
+ Racket's @racket[class] form accepts more complex expressions on the right-hand-side of @racket[define-values]. We could approach this feature by creating a macro-extensible @racket[method-procedure] nonterminal. Unfortunately, @racket[syntax-spec] is missing features required for expansions in this context. @hyperlink["https://github.com/michaelballantyne/syntax-spec/issues/91"]{Issue}
+}
 
-The key piece that allows us to re-interpret Racket syntax is @racket[#:allow-extension racket-macro]. This means built-in macros like @racket[define] and @racket[define-syntax], which eventually translate to @racket[define-values] and @racket[define-syntaxes] respectively, can be used in our DSL. In fact, any definition forms can be used, even fancy ones like @racket[match-define], as long as they eventually expand down to @racket[define-values]. Our grammar has to match on fully expanded Racket syntax, which is what we're doing here.
+The key piece that allows us to re-interpret Racket syntax is the @racket[racket-macro] @tech[#:key "extension classes"]{extension class}. This extension class allows any definition form that eventually translates to @racket[define-values] and @racket[define-syntaxes] to be used in our DSL. This includes @racket[define] and @racket[define-syntax], but also fancy ones like @racket[define/match]. We do require that @racket[define-values] forms have a @racket[lambda] on the right-hand-side so that we can parse the method arguments and body.
 
 As an example, let's think about how a method definition might expand:
 
@@ -85,20 +90,29 @@ This is exactly what our method production looks for.
 
 @section{Procedural Layer}
 
-Next, let's think about how we can actually implement classes. We'll define two data types:
+Next, let's think about how we will represent classes at runtime. We'll define two data types:
 
 @racketblock[
+(code:comment2 "A ClassInfo is a")
 (struct class-info [methods constructor])
+(code:comment2 "where")
+(code:comment2 "methods is a (Hash Symbol Procedure)")
+(code:comment2 "constructor is a (Any ... -> Object)")
+
+(code:comment2 "An Object is a")
 (struct object [fields class])
+(code:comment2 "where")
+(code:comment2 "fields is a (MutableVectorOf Any)")
+(code:comment2 "class is a ClassInfo")
 ]
 
 A @racket[class-info] represents a class itself. @racket[methods] is a hash table mapping method names (symbols) to method implementations. Methods will be implemented as functions whose first argument is @racket[this] and subsequent arguments are the explicit arguments to the method. @racket[constructor] takes in an argument for each field and returns an instance of the class, which is an @racket[object].
 
 A @racket[object] represents an instance of a class. It has its fields as a vector of values (in the same order as the constructor), and the @racket[class-info] containing its methods.
 
-Since methods are class-specific and take in @racket[this] as an argument, we can make one re-usable @racket[class-info] for the class and every instance will get a reference to it. But fields are instance-specific so each @racket[object] needs its own. The reason we use a symbol mapping for methods and a vector for fields is because fields are lexical and resolved hygienically, and methods use (non-hygienic) symbolic equality via @racket[send]. During compilation, fields will be associated with their index whereas methods will just be associated with their symbolic name.
+Methods always access the instance via @racket[this]. So we can create one set of procedures in the @racket[class-info] structure and share it across all instances. But fields are instance-specific, so each @racket[object] needs its own. Fields are only accessed from within the class so we can transform each field access to a vector access at an index corresponding to the field. Methods may be referenced inside the class, but they may also be referenced externally via @racket[send] with a dynamically constructed symbol. Thus, we need to be able to access methods by their symbolic name.
 
-Now that we've defined our data types, we can implement some utilities:
+Now that we've defined our data types, we can implement functionality for constructing objects and calling methods:
 
 @racketblock[
 (define (new cls . fields)
@@ -117,30 +131,38 @@ Now that we've defined our data types, we can implement some utilities:
     (apply method obj args)))
 ]
 
-Recall our example:
+Now let's think about how we will compile the main class form. Recall our example:
 
 @repl[
-(define foo%
+(define posn%
   (class
-    (field x)
-    (define (add y) (+ x y))))
-(define foo (new foo% 1))
-(send foo add 2)
+    (field x y)
+    (define (scale k) (new posn% (* x k) (* y k)))
+    (define (displayln) `(posn ,x ,y))))
+(define p (new posn% 1 2))
+(send (send p scale 3) displayln)
 ]
 
-That would look something like this when compiled:
+We would like that to compile to something like this:
 
 @repl[
-(define foo%
-  (class-info (hash 'add (lambda (this-arg y)
-                           (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
-                             (+ (vector-ref (object-fields this) 0) y))))
-              (lambda (x) (object (vector x) foo%))))
-(define foo (new foo% 1))
-(send-rt foo 'add (list 2))
+(define posn%
+  (class-info (hash 'scale (lambda (this-arg k)
+                             (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
+                               (new posn% (* (vector-ref (object-fields this) 0) k)
+                                          (* (vector-ref (object-fields this) 1) k))))
+                    'displayln (lambda (this-arg)
+                                 (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
+                                   `(posn ,(vector-ref (object-fields this) 0) 
+                                          ,(vector-ref (object-fields this) 1)))))
+              (lambda (x y) (object (vector x y) posn%))))
+(define p (new posn% 1 2))
+(send-rt (send-rt p 'scale (list 3)) 'displayln (list))
 ]
 
-We'll get into how @racket[this] works soon.
+We have to create a dynamic mapping from method names to procedures and a static association between fields and vector indices. We also have to make sure method procedures have an implicit @racket[this-arg] argument for taking in the instance, and set up @racket[this] to refer to @racket[this-arg] in the body of the method.
+
+This is a bit of a simplification, but gives us the general idea of how classes will compile.
 
 @section[#:tag "miniclass-compiler"]{Compiler}
 
@@ -155,7 +177,7 @@ Now let's implement this compilation.
     (compile-class-body defns fields exprs)))
 ]
 
-First, we splice @racket[begin]s so we get a flat list of top-level forms (field declarations, method definitions, and Racket expressions). Then, we group these top-level forms based on their type. Finally, we compile these forms to Racket.
+First, we splice @racket[begin]s so we get a flat list of class-level forms (field declarations, method definitions, and Racket expressions). Then, we group these class-level forms based on their type. Finally, we compile these forms to Racket.
 
 Here is how we splice @racket[begin]s:
 
@@ -183,19 +205,19 @@ Here is the code for grouping up class-level forms:
     (syntax-parse exprs
       #:literals (define-values define-syntaxes field)
       [((~alt (~and defn (define-values . _))
-              (code:comment "ignore because they don't end up in the generated code")
               (~and stx-defn (define-syntaxes . _))
-              (~and field-decl (field . _))
+              (field field-name ...)
               expr)
         ...)
+       (code:comment "discard stx-defn because syntax definitions don't end up in the generated code")
        (values (attribute defn)
-               (attribute field-decl)
+               #'(field-name ... ...)
                (attribute expr))])))
 ]
 
 It's just straightforward syntax manipulation, taking advantage of @racket[syntax-parse]'s powerful patterns.
 
-For compilation, we can start with the method reference compilers:
+For compilation, we start with the method reference compilers:
 
 @racketblock[
 #:escape unracket
@@ -207,12 +229,12 @@ For compilation, we can start with the method reference compilers:
         #'(lambda args (send this name . args))]))))
 ]
 
-Inside of the @racket[class] body, if you reference a method directly, it is just a variable that refers to a procedure that invokes the method.
+Inside of the @racket[class] body, if you reference a method directly, the reference expands to a procedure that invokes the method via @racket[send].
 
 @racketblock[
 #:escape unracket
 (begin-for-syntax
-  (define-persistent-symbol-table field-index-table)
+  (define field-index-table (local-symbol-table))
 
   (define field-reference-compiler
     (make-variable-like-reference-compiler
@@ -226,10 +248,9 @@ Inside of the @racket[class] body, if you reference a method directly, it is jus
           #`(vector-set! (object-fields this) #,idx rhs))]))))
 ]
 
+Field references access or mutate the object's field vector. We use a symbol table to map field names to indices. This table will be used across all classes, which is safe due to hygiene. We use a local symbol table rather than a persistent one since fields can only be referenced from within the class definition, which means we don't need the table entries to persist across separate compilations.
 
-Field references access or mutate the object's field vector. We use a global persistent symbol table to map field names to indices for convenience. This is safe due to hygiene.
-
-Now let's compile top-level forms:
+This table is populated in @racket[compile-class-body], which we'll look at next:
 
 @racketblock[
 #:escape unracket
@@ -238,8 +259,7 @@ Now let's compile top-level forms:
     (syntax-parse (list defns fields exprs)
       #:literals (define-values field)
       [(((define-values (method-name:id) (_ (method-arg:id ...) method-body:expr ...)) ...)
-        (code:comment "only 1 field definition allowed")
-        ((~optional (field field-name:id ...) #:defaults ([(field-name 1) null])))
+        (field-name:id ...)
         (expr ...))
        (check-duplicate-method-names (attribute method-name))
        (for ([field-name (attribute field-name)]
@@ -271,6 +291,9 @@ Now let's compile top-level forms:
       (when duplicate
         (raise-syntax-error #f "a method with same name has already been defined" duplicate)))))
 ]
+
+@; TODO pull out helpers
+@; TODO think about features and challenges for a language with macros and good IDE
 
 This is a lot, so let's go through it step by step.
 
@@ -327,7 +350,7 @@ Finally, let's define the syntax parameter for @racket[this]:
 That's it. We now have a simple class DSL. To summarize the key points:
 
 @itemlist[
-  @item{We have productions with literals of fully expanded Racket forms to detect definitions and re-interpret them.}
+  @item{We have productions with literals of expanded Racket forms to detect definitions and re-interpret them.}
   @item{We use @racket[#:allow-extension racket-macro] to expand any Racket definitions down to @racket[define-values] and @racket[define-syntaxes].}
   @item{We use @racket[racket-body] for Racket definitions or expressions, and @racket[racket-expr] for just expressions.}
   @item{We use a syntax parameter for @racket[this], which gets set in the compiler to refer to the instance. But when used outside of a class body, it is a syntax error.}
