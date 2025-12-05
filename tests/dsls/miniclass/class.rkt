@@ -61,8 +61,8 @@
   (host-interface/expression
     (class e:class-form ...)
     #:binding (scope (import e) ...)
-    (define-values (defns fields exprs) (group-class-decls (splice-begins (attribute e))))
-    (compile-class-body defns fields exprs)))
+    (define-values (defns fields constructor-body) (group-class-decls (splice-begins (attribute e))))
+    (compile-class-body defns fields constructor-body)))
 
 (begin-for-syntax
   (define field-index-table (local-symbol-table))
@@ -88,47 +88,58 @@
       [((~alt (~and defn (define-values . _))
               (~and stx-defn (define-syntaxes . _))
               (field field-name ...)
-              expr)
+              constructor-body)
         ...)
        ;; discard stx-defn because syntax definitions don't end up in the generated code
        (values (attribute defn)
                #'(field-name ... ...)
-               (attribute expr))]))
+               (attribute constructor-body))]))
 
   #;((listof syntax?) (listof syntax?) (listof syntax?) -> syntax?)
   ;; compile the partially expanded class-level definitions into pure racket code.
   ;; This is the actual class logic.
-  (define (compile-class-body defns fields exprs)
-    (syntax-parse (list defns fields exprs)
+  (define (compile-class-body defns fields constructor-body)
+    (syntax-parse (list defns fields constructor-body)
       #:literals (define-values field)
       [(((define-values (method-name:id) (_ (method-arg:id ...) method-body:expr ...)) ...)
         (field-name:id ...)
-        (expr ...))
-       (check-duplicate-method-names (attribute method-name))
-       (for ([field-name (attribute field-name)]
-             [field-index (in-naturals)])
-         (symbol-table-set! field-index-table field-name field-index))
-       #'(letrec ([methods
-                   (make-immutable-hash
-                    (list
-                     (cons 'method-name
-                           (lambda (this-arg method-arg ...)
-                             (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
-                               method-body
-                               ...)))
-                     ...))]
-                  [constructor
-                   (lambda (field-name ...)
-                     (let ([this-val (object (vector field-name ...) cls)])
-                       (syntax-parameterize ([this (make-variable-like-transformer #'this-val)])
-                         ;; ensure body is non-empty
-                         (void)
-                         expr
-                         ...)
-                       this-val))]
-                  [cls
-                   (class-info methods constructor)])
+        (constructor-body ...))
+       (define/syntax-parse method-table (compile-methods (attribute method-name) (attribute method-arg) (attribute method-body)))
+       (define/syntax-parse constructor-procedure (compile-constructor (attribute field-name) #'cls (attribute constructor-body)))
+       #'(letrec ([methods method-table]
+                  [constructor constructor-procedure]
+                  [cls (class-info methods constructor)])
            cls)]))
+  
+  #;((listof identifier?) (listof (listof identifier?)) (listof syntax?) -> syntax?)
+  (define (compile-methods method-name method-arg method-body)
+    (check-duplicate-method-names method-name)
+    (syntax-parse (list method-name method-arg method-body)
+      [((method-name ...) ((method-arg ...) ...) ((method-body ...) ...))
+       #'(make-immutable-hash
+          (list
+           (cons 'method-name
+                 (lambda (this-arg method-arg ...)
+                   (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
+                     method-body
+                     ...)))
+           ...))]))
+
+  #;((listof identifier?) identifier? (listof syntax?) -> syntax?)
+  (define (compile-constructor field-name cls constructor-body)
+    (for ([field-name field-name]
+          [field-index (in-naturals)])
+      (symbol-table-set! field-index-table field-name field-index))
+    (syntax-parse (list field-name cls constructor-body)
+      [((field-name ...) cls (constructor-body ...))
+       #'(lambda (field-name ...)
+           (let ([this-val (object (vector field-name ...) cls)])
+             (syntax-parameterize ([this (make-variable-like-transformer #'this-val)])
+               ;; ensure body is non-empty
+               (void)
+               constructor-body
+               ...)
+             this-val))]))
 
   (define method-reference-compiler
     (make-variable-like-reference-compiler

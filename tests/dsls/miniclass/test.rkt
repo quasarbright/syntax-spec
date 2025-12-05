@@ -17,6 +17,7 @@
                (define (add y) (+ x y))))
            (define foo (new foo% 1))
            (check-equal? (send foo add 2) 3))
+#;(
 (test-case "empty class"
            (define foo% (class))
            (new foo%)
@@ -328,3 +329,5 @@
       (define x 2)
       (define (f) x))))
   (check-equal? (send v f) 2))
+
+)

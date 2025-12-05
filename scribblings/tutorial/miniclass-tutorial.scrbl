@@ -173,8 +173,8 @@ Now let's implement this compilation.
   (host-interface/expression
     (class e:class-form ...)
     #:binding (scope (import e) ...)
-    (define-values (defns fields exprs) (group-class-decls (splice-begins (attribute e))))
-    (compile-class-body defns fields exprs)))
+    (define-values (defns fields constructor-body) (group-class-decls (splice-begins (attribute e))))
+    (compile-class-body defns fields constructor-body)))
 ]
 
 First, we splice @racket[begin]s so we get a flat list of class-level forms (field declarations, method definitions, and Racket expressions). Then, we group these class-level forms based on their type. Finally, we compile these forms to Racket.
@@ -207,12 +207,12 @@ Here is the code for grouping up class-level forms:
       [((~alt (~and defn (define-values . _))
               (~and stx-defn (define-syntaxes . _))
               (field field-name ...)
-              expr)
+              constructor-body)
         ...)
-       (code:comment "discard stx-defn because syntax definitions don't end up in the generated code")
+       ;; discard stx-defn because syntax definitions don't end up in the generated code
        (values (attribute defn)
                #'(field-name ... ...)
-               (attribute expr))])))
+               (attribute constructor-body))])))
 ]
 
 It's just straightforward syntax manipulation, taking advantage of @racket[syntax-parse]'s powerful patterns.
@@ -250,41 +250,43 @@ Inside of the @racket[class] body, if you reference a method directly, the refer
 
 Field references access or mutate the object's field vector. We use a symbol table to map field names to indices. This table will be used across all classes, which is safe due to hygiene. We use a local symbol table rather than a persistent one since fields can only be referenced from within the class definition, which means we don't need the table entries to persist across separate compilations.
 
-This table is populated in @racket[compile-class-body], which we'll look at next:
+This table is populated in @racket[compile-constructor], which we'll look at soon. For now, let's start compiling the class body:
 
 @racketblock[
 #:escape unracket
 (begin-for-syntax
-  (define (compile-class-body defns fields exprs)
-    (syntax-parse (list defns fields exprs)
+  (define (compile-class-body defns fields constructor-body)
+    (syntax-parse (list defns fields constructor-body)
       #:literals (define-values field)
       [(((define-values (method-name:id) (_ (method-arg:id ...) method-body:expr ...)) ...)
         (field-name:id ...)
-        (expr ...))
-       (check-duplicate-method-names (attribute method-name))
-       (for ([field-name (attribute field-name)]
-             [field-index (in-naturals)])
-         (symbol-table-set! field-index-table field-name field-index))
-       #'(letrec ([methods
-                   (make-immutable-hash
-                    (list
-                     (cons 'method-name
-                           (lambda (this-arg method-arg ...)
-                             (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
-                               method-body
-                               ...)))
-                     ...))]
-                  [constructor
-                   (lambda (field-name ...)
-                     (let ([this-val (object (vector field-name ...) cls)])
-                       (syntax-parameterize ([this (make-variable-like-transformer #'this-val)])
-                         (void)
-                         expr
-                         ...)
-                       this-val))]
-                  [cls
-                   (class-info methods constructor)])
-           cls)]))
+        (constructor-body ...))
+       (define/syntax-parse method-table (compile-methods (attribute method-name) (attribute method-arg) (attribute method-body)))
+       (define/syntax-parse constructor-procedure (compile-constructor (attribute field-name) #'cls (attribute constructor-body)))
+       #'(letrec ([methods method-table]
+                  [constructor constructor-procedure]
+                  [cls (class-info methods constructor)])
+           cls)])))
+]
+
+We generate syntax that creates the method table, constructor procedure, and class info in a letrec. We need recursion because the constructor procedure returns an object with class info @racket[cls].
+
+Now let's see how we compile methods:
+
+@racketblock[
+(begin-for-syntax
+  (define (compile-methods method-name method-arg method-body)
+    (check-duplicate-method-names method-name)
+    (syntax-parse (list method-name method-arg method-body)
+      [((method-name ...) ((method-arg ...) ...) ((method-body ...) ...))
+       #'(make-immutable-hash
+          (list
+           (cons 'method-name
+                 (lambda (this-arg method-arg ...)
+                   (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
+                     method-body
+                     ...)))
+           ...))]))
 
   (define (check-duplicate-method-names names)
     (let ([duplicate (check-duplicates names #:key syntax->datum)])
@@ -292,51 +294,33 @@ This table is populated in @racket[compile-class-body], which we'll look at next
         (raise-syntax-error #f "a method with same name has already been defined" duplicate)))))
 ]
 
-@; TODO pull out helpers
-@; TODO think about features and challenges for a language with macros and good IDE
-
-This is a lot, so let's go through it step by step.
-
-First, we check for duplicate method names and associate fields with indices.
-
-@racketblock[
-(check-duplicate-method-names (attribute method-name))
-(for ([field-name (attribute field-name)]
-      [field-index (in-naturals)])
-(symbol-table-set! field-index-table field-name field-index))
-]
-
-Next comes the generated syntax:
-
-@racketblock[
-#'(letrec ([methods
-            (make-immutable-hash
-             (list
-              (cons 'method-name
-                    (lambda (this-arg method-arg ...)
-                      (syntax-parameterize ([this (make-variable-like-transformer #'this-arg)])
-                        method-body
-                        ...)))
-              ...))]
-           [constructor
-            (lambda (field-name ...)
-              (let ([this-val (object (vector field-name ...) cls)])
-                (syntax-parameterize ([this (make-variable-like-transformer #'this-val)])
-                  (void)
-                  expr
-                  ...)
-                this-val))]
-           [cls
-            (class-info methods constructor)])
-    cls)
-]
-
-We recursively define the methods, constructor, and the class itself, and return the class when we're done.
-
-The methods are a mapping from method name to procedure. We set up @racket[this] to refer to the first argument, which is the instance of the class, and the rest of the arguments are those passed in from @racket[send].
+The method table is a mapping from method name to procedure. We set up @racket[this] to refer to the first argument, which is the instance of the class, and the rest of the arguments are those passed in from @racket[send].
 @;TODO is it safe to use the symbols? Are they actually renamed the right way? Or do you have to gensym.
 
+We treat method names as symbols to support dynamic dispatch. Symbols are non-hygienic, so we need to do a duplicate method name check on the symbolic names of methods.
+
+Now let's see how the constructor is compiled:
+
+@racketblock[
+(define (compile-constructor field-name cls constructor-body)
+  (for ([field-name field-name]
+        [field-index (in-naturals)])
+    (symbol-table-set! field-index-table field-name field-index))
+  (syntax-parse (list field-name cls constructor-body)
+    [((field-name ...) cls (constructor-body ...))
+     #'(lambda (field-name ...)
+         (let ([this-val (object (vector field-name ...) cls)])
+           (syntax-parameterize ([this (make-variable-like-transformer #'this-val)])
+             ;; ensure body is non-empty
+             (void)
+             constructor-body
+             ...)
+           this-val))]))
+]
+
 The constructor takes in values for the fields, creates an instance and binds it to @racket[this], runs the class-level Racket expressions, and finally returns the instance.
+
+We also associate field names with their vector indices according to their declaration order for @racket[field-reference-compiler].
 
 Finally, let's define the syntax parameter for @racket[this]:
 
